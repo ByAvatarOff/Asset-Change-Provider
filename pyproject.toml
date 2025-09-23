@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "news_provider"
+version = "0.1.0"
+description = ""
+authors = ["tesevich_vs <tesevich_vs@nlmk.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.116.1"
+uvicorn = "^0.35.0"
+pydantic = "^2.11.7"
+aio-pika = "^9.5.7"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
