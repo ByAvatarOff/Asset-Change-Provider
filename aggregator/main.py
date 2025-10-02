@@ -1,247 +1,171 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
-from typing import List, Optional
 import asyncio
-import aio_pika
-from datetime import datetime
-import json
 import logging
-from enum import Enum
-import openai
-import os
+import signal
 
-app = FastAPI(title="Crypto News Aggregator", version="1.0.0")
+from gateways.binance.base import Client, BinanceClient
+from gateways.rabbit.base import RabbitMqConnector
+from gateways.rabbit.consumer import Consumer, RabbitMqConsumer
+from gateways.rabbit.producer import Producer, RabbitMqProducer
 
-
-# Модели данных
-class NewsType(str, Enum):
-    BULLISH = "bullish"
-    BEARISH = "bearish"
-    NEUTRAL = "neutral"
+logger = logging.getLogger(__name__)
 
 
-class NewsSource(str, Enum):
-    COINDESK = "coindesk"
-    COINTELEGRAPH = "cointelegraph"
-    TWITTER = "twitter"
-    REDDIT = "reddit"
+class MainService:
+    def __init__(self, consumer: Consumer, producer: Producer, client: Client) -> None:
+        self._producer = producer
+        self._consumer = consumer
+        self._client = client
 
+        self.active_connections: dict[str, asyncio.Task] = {}
+        self.user_subscriptions: dict[str, set[str]] = {}
+        self.is_running = True
 
-class RawNews(BaseModel):
-    title: str
-    content: str
-    source: NewsSource
-    url: Optional[str] = None
-    published_at: Optional[datetime] = None
-
-
-class ClassifiedNews(BaseModel):
-    id: str
-    title: str
-    content: str
-    source: NewsSource
-    news_type: NewsType
-    confidence: float
-    url: Optional[str] = None
-    published_at: datetime
-    classified_at: datetime
-
-
-class RabbitMQManager:
-    def __init__(self):
-        self.connection = None
-        self.channel = None
-
-    async def connect(self):
+    async def process_command(self, message: dict) -> None:
         try:
-            self.connection = await aio_pika.connect_robust(
-                "amqp://guest:guest@localhost:5672/"
-            )
-            self.channel = await self.connection.channel()
+            user_id = message.get('user_id')
+            symbols = message.get('symbols', [])
+            thresholds = message.get('thresholds', [])  # TODO use
+            timeframe = message.get('timeframe', '1m')
 
-            # Создаем exchange для новостей
-            self.news_exchange = await self.channel.declare_exchange(
-                'crypto_news',
-                aio_pika.ExchangeType.TOPIC,
-                durable=True
-            )
-
-            logger.info("Connected to RabbitMQ")
-        except Exception as e:
-            logger.error(f"Failed to connect to RabbitMQ: {e}")
-            raise
-
-    async def publish_news(self, news: ClassifiedNews):
-        try:
-            routing_key = f"news.{news.news_type.value}.{news.source.value}"
-            message_body = news.json()
-
-            message = aio_pika.Message(
-                message_body.encode(),
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                headers={
-                    'news_type': news.news_type.value,
-                    'source': news.source.value,
-                    'timestamp': news.classified_at.isoformat()
-                }
-            )
-
-            await self.news_exchange.publish(message, routing_key=routing_key)
-            logger.info(f"Published news with routing key: {routing_key}")
+            await self.subscribe_user(user_id, symbols, timeframe, thresholds)
+            logger.info(f"Subscribed user {user_id} to {symbols}")
 
         except Exception as e:
-            logger.error(f"Failed to publish message: {e}")
-            raise
+            logger.error(f"Error processing command: {e}")
 
-    async def close(self):
-        if self.connection:
-            await self.connection.close()
-
-
-# AI News Classifier
-class NewsClassifier:
-    def __init__(self):
-        # Инициализация OpenAI API (замените на ваш ключ)
-        openai.api_key = os.getenv("OPENAI_API_KEY", "your-api-key-here")
-
-    async def classify_news(self, news: RawNews) -> tuple[NewsType, float]:
-        """
-        Классифицирует новость с помощью AI
-        Возвращает тип новости и уровень уверенности
-        """
+    async def send_ticker_info(self, user_id: str, symbols: list[str], timeframe: str, thresholds: list[float]) -> None:
+        """Отправка информации о тикерах для конкретного пользователя"""
         try:
-            prompt = f"""
-            Classify the following cryptocurrency news as BULLISH, BEARISH, or NEUTRAL.
-            Also provide a confidence score from 0.0 to 1.0.
+            async for message in self._client.get_ticket_info(symbols=symbols, timeframe=timeframe):
+                logger.info(
+                    f"Start get message {message}"
+                )
+                if not message:  # Пропускаем пустые сообщения
+                    continue
 
-            Title: {news.title}
-            Content: {news.content[:500]}...
+                # TODO: Реализовать логику определения уровня на основе thresholds
+                change_level = self._calculate_change_level(message['price_change_percent'], thresholds)
+                routing_key = f"level_{change_level}"
 
-            Return only in this format:
-            Classification: [BULLISH/BEARISH/NEUTRAL]
-            Confidence: [0.0-1.0]
-            """
+                # Добавляем user_id в сообщение
+                message['user_id'] = user_id
+                message['change_level'] = change_level
 
-            # Для демонстрации используем простую логику
-            # В реальном проекте здесь будет вызов к OpenAI API
-            content_lower = (news.title + " " + news.content).lower()
-
-            bullish_keywords = ['moon', 'bull', 'rise', 'up', 'growth', 'adoption', 'positive', 'gain']
-            bearish_keywords = ['crash', 'bear', 'fall', 'down', 'drop', 'negative', 'loss', 'dump']
-
-            bullish_score = sum(1 for keyword in bullish_keywords if keyword in content_lower)
-            bearish_score = sum(1 for keyword in bearish_keywords if keyword in content_lower)
-
-            if bullish_score > bearish_score:
-                return NewsType.BULLISH, min(0.9, 0.5 + bullish_score * 0.1)
-            elif bearish_score > bullish_score:
-                return NewsType.BEARISH, min(0.9, 0.5 + bearish_score * 0.1)
-            else:
-                return NewsType.NEUTRAL, 0.6
+                await self._producer.produce(routing_key=routing_key, message=message)
+                logger.info(
+                    f"Sent {message['symbol']} change {message['price_change_percent']:.2f}% to level {change_level}"
+                )
 
         except Exception as e:
-            logger.error(f"Classification error: {e}")
-            return NewsType.NEUTRAL, 0.3
+            logger.error(f"Error in send_ticker_info for user {user_id}: {e}")
 
+    def _calculate_change_level(self, change_percent: float, thresholds: list[float]) -> int:
+        """Определение уровня изменения на основе порогов"""
+        change_abs = abs(change_percent)
+        for level, threshold in enumerate(thresholds, 1):
+            if change_abs >= threshold:
+                return level
+        return 0
 
-# Глобальные переменные
-rabbitmq_manager = RabbitMQManager()
-news_classifier = NewsClassifier()
+    async def subscribe_user(self, user_id: str, symbols: list[str], timeframe: str, thresholds: list[float]) -> None:
+        await self.unsubscribe_user(user_id)
 
+        if not symbols:
+            logger.error(f"No symbols provided for user {user_id}")
+            return
 
-# События жизненного цикла приложения
-@app.on_event("startup")
-async def startup_event():
-    await rabbitmq_manager.connect()
+        task = asyncio.create_task(
+            self.send_ticker_info(user_id=user_id, symbols=symbols, timeframe=timeframe, thresholds=thresholds)
+        )
+        self.active_connections[user_id] = task
+        self.user_subscriptions[user_id] = set(symbols)
+        logger.info(f"Started WebSocket monitoring for user {user_id}: {symbols}")
 
+    async def unsubscribe_user(self, user_id: str) -> None:
+        if user_id in self.active_connections:
+            task = self.active_connections[user_id]
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    logger.debug(f"Task for user {user_id} cancelled")
+                except Exception as e:
+                    logger.error(f"Error cancelling task for user {user_id}: {e}")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await rabbitmq_manager.close()
+            del self.active_connections[user_id]
+            if user_id in self.user_subscriptions:
+                del self.user_subscriptions[user_id]
 
+            logger.info(f"Unsubscribed user {user_id}")
 
-# API endpoints
-@app.post("/news/process", response_model=dict)
-async def process_news(news: RawNews, background_tasks: BackgroundTasks):
-    """Обрабатывает входящую новость"""
-    try:
-        # Классифицируем новость
-        news_type, confidence = await news_classifier.classify_news(news)
-
-        # Создаем классифицированную новость
-        classified_news = ClassifiedNews(
-            id=f"{news.source.value}_{datetime.now().timestamp()}",
-            title=news.title,
-            content=news.content,
-            source=news.source,
-            news_type=news_type,
-            confidence=confidence,
-            url=news.url,
-            published_at=news.published_at or datetime.now(),
-            classified_at=datetime.now()
+    async def start(self):
+        """Запуск сервиса"""
+        logger.info("Starting MainService...")
+        # Запускаем потребителя в отдельной задаче
+        consume_task = asyncio.create_task(
+            self._consumer.consume(command=self.process_command, queue="commands")
         )
 
-        # Отправляем в RabbitMQ асинхронно
-        background_tasks.add_task(rabbitmq_manager.publish_news, classified_news)
-
-        return {
-            "status": "success",
-            "news_id": classified_news.id,
-            "classification": news_type.value,
-            "confidence": confidence
-        }
-
-    except Exception as e:
-        logger.error(f"Error processing news: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process news")
-
-
-@app.post("/news/batch-process", response_model=dict)
-async def batch_process_news(news_list: List[RawNews], background_tasks: BackgroundTasks):
-    """Обрабатывает множество новостей"""
-    processed_count = 0
-
-    for news in news_list:
         try:
-            news_type, confidence = await news_classifier.classify_news(news)
+            while self.is_running:
+                await asyncio.sleep(1)
+        finally:
+            consume_task.cancel()
+            try:
+                await consume_task
+            except asyncio.CancelledError:
+                pass
 
-            classified_news = ClassifiedNews(
-                id=f"{news.source.value}_{datetime.now().timestamp()}_{processed_count}",
-                title=news.title,
-                content=news.content,
-                source=news.source,
-                news_type=news_type,
-                confidence=confidence,
-                url=news.url,
-                published_at=news.published_at or datetime.now(),
-                classified_at=datetime.now()
-            )
+    async def stop(self):
+        logger.info("Stopping MainService...")
+        self.is_running = False
 
-            background_tasks.add_task(rabbitmq_manager.publish_news, classified_news)
-            processed_count += 1
+        # Останавливаем binance client
+        if hasattr(self._client, 'stop'):
+            await self._client.stop()
 
-        except Exception as e:
-            logger.error(f"Error processing news item: {e}")
-            continue
+        # Отписываем всех пользователей
+        for user_id in list(self.active_connections.keys()):
+            await self.unsubscribe_user(user_id)
 
-    return {
-        "status": "success",
-        "processed_count": processed_count,
-        "total_count": len(news_list)
-    }
+        await self._consumer.disconnect()
+        await self._producer.disconnect()
+        logger.info("MainService stopped")
 
 
-@app.get("/health")
-async def health_check():
-    """Проверка состояния сервиса"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now(),
-        "service": "crypto-news-aggregator"
-    }
+async def main():
+    connector = RabbitMqConnector()
+    await connector.connect()
+
+    service = MainService(
+        consumer=RabbitMqConsumer(connector=connector),
+        producer=RabbitMqProducer(connector=connector),
+        client=BinanceClient()
+    )
+
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}")
+        asyncio.create_task(service.stop())
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        await service.start()
+    except KeyboardInterrupt:
+        logger.info("Service interrupted by user")
+    except Exception as e:
+        logger.error(f"Service failed: {e}")
+    finally:
+        if service.is_running:
+            await service.stop()
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Настройка логирования
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    asyncio.run(main())
