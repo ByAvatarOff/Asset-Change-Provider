@@ -14,7 +14,6 @@ PORT=${RABBITMQ_MANAGEMENT_POR}
 echo "Waiting for RabbitMQ to be ready..."
 if rabbitmq-diagnostics -q ping > /dev/null 2>&1; then
   echo "RabbitMQ is ready!"
-  break
 else
   cho "Attempt $i/30: RabbitMQ not ready yet..."
   exit 1
@@ -44,6 +43,7 @@ echo "Binding queues to exchange..."
 rabbitmqadmin declare binding source=price_changes destination_type=queue destination=price_change_level_1 routing_key=level_1
 rabbitmqadmin declare binding source=price_changes destination_type=queue destination=price_change_level_2 routing_key=level_2
 rabbitmqadmin declare binding source=price_changes destination_type=queue destination=price_change_level_3 routing_key=level_3
+rabbitmqadmin declare binding source=price_changes destination_type=queue destination=commands routing_key=commands
 
 # List created queues and bindings
 echo ""

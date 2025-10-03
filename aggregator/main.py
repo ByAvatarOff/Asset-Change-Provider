@@ -2,10 +2,11 @@ import asyncio
 import logging
 import signal
 
-from gateways.binance.base import Client, BinanceClient
-from gateways.rabbit.base import RabbitMqConnector
-from gateways.rabbit.consumer import Consumer, RabbitMqConsumer
-from gateways.rabbit.producer import Producer, RabbitMqProducer
+from aggregator.gateways.binance.base import Client, BinanceClient
+from aggregator.gateways.rabbit.base import RabbitMqConnector
+from aggregator.gateways.rabbit.consumer import Consumer, RabbitMqConsumer
+from aggregator.gateways.rabbit.producer import Producer, RabbitMqProducer
+from aggregator.schemas.models import InputCommand, ActionEnum
 
 logger = logging.getLogger(__name__)
 
@@ -22,44 +23,50 @@ class MainService:
 
     async def process_command(self, message: dict) -> None:
         try:
-            user_id = message.get('user_id')
-            symbols = message.get('symbols', [])
-            thresholds = message.get('thresholds', [])  # TODO use
-            timeframe = message.get('timeframe', '1m')
-
-            await self.subscribe_user(user_id, symbols, timeframe, thresholds)
-            logger.info(f"Subscribed user {user_id} to {symbols}")
+            message_schema = InputCommand(**message)
+            if message_schema.action == ActionEnum.SUBSCRIBE:
+                await self._subscribe_user(message_schema=message_schema)
+            elif message_schema.action == ActionEnum.UNSUBSCRIBE:
+                await self._unsubscribe_user(user_id=message_schema.user_id)
+            else:
+                raise NotImplemented("Action not found")
 
         except Exception as e:
             logger.error(f"Error processing command: {e}")
 
-    async def send_ticker_info(self, user_id: str, symbols: list[str], timeframe: str, thresholds: list[float]) -> None:
+    async def send_ticker_info(self, message_schema: InputCommand) -> None:
         """Отправка информации о тикерах для конкретного пользователя"""
         try:
-            async for message in self._client.get_ticket_info(symbols=symbols, timeframe=timeframe):
+            async for message in self._client.get_ticket_info(
+                    symbols=message_schema.symbols, timeframe=message_schema.timeframe
+            ):
                 logger.info(
                     f"Start get message {message}"
                 )
-                if not message:  # Пропускаем пустые сообщения
+                if not message:
                     continue
 
-                # TODO: Реализовать логику определения уровня на основе thresholds
-                change_level = self._calculate_change_level(message['price_change_percent'], thresholds)
+                change_level = self._calculate_change_level(message.price_change_percent, message_schema.thresholds)
+
+                # пропускаем если процент меньше чем нужно
+                if change_level == 0:
+                    continue
+
                 routing_key = f"level_{change_level}"
 
-                # Добавляем user_id в сообщение
-                message['user_id'] = user_id
-                message['change_level'] = change_level
+                message.user_id = message_schema.user_id
+                message.change_level = change_level
 
-                await self._producer.produce(routing_key=routing_key, message=message)
+                await self._producer.produce(routing_key=routing_key, message=message.model_dump(mode="json"))
                 logger.info(
-                    f"Sent {message['symbol']} change {message['price_change_percent']:.2f}% to level {change_level}"
+                    f'Sent {message.symbol} change {message.price_change_percent:.2f}% to level {change_level}'
                 )
 
         except Exception as e:
-            logger.error(f"Error in send_ticker_info for user {user_id}: {e}")
+            logger.error(f"Error in send_ticker_info for user {message_schema.user_id}: {e}")
 
-    def _calculate_change_level(self, change_percent: float, thresholds: list[float]) -> int:
+    @staticmethod
+    def _calculate_change_level(change_percent: float, thresholds: list[float]) -> int:
         """Определение уровня изменения на основе порогов"""
         change_abs = abs(change_percent)
         for level, threshold in enumerate(thresholds, 1):
@@ -67,21 +74,19 @@ class MainService:
                 return level
         return 0
 
-    async def subscribe_user(self, user_id: str, symbols: list[str], timeframe: str, thresholds: list[float]) -> None:
-        await self.unsubscribe_user(user_id)
+    async def _subscribe_user(self, message_schema: InputCommand) -> None:
+        await self._unsubscribe_user(message_schema.user_id)
 
-        if not symbols:
-            logger.error(f"No symbols provided for user {user_id}")
+        if not message_schema.symbols:
+            logger.error(f"No symbols provided for user {message_schema.user_id}")
             return
 
-        task = asyncio.create_task(
-            self.send_ticker_info(user_id=user_id, symbols=symbols, timeframe=timeframe, thresholds=thresholds)
-        )
-        self.active_connections[user_id] = task
-        self.user_subscriptions[user_id] = set(symbols)
-        logger.info(f"Started WebSocket monitoring for user {user_id}: {symbols}")
+        task = asyncio.create_task(self.send_ticker_info(message_schema=message_schema))
+        self.active_connections[message_schema.user_id] = task
+        self.user_subscriptions[message_schema.user_id] = set(message_schema.symbols)
+        logger.info(f"Started WebSocket monitoring for user {message_schema.user_id}: {message_schema.symbols}")
 
-    async def unsubscribe_user(self, user_id: str) -> None:
+    async def _unsubscribe_user(self, user_id: str) -> None:
         if user_id in self.active_connections:
             task = self.active_connections[user_id]
             if not task.done():
@@ -102,11 +107,11 @@ class MainService:
     async def start(self):
         """Запуск сервиса"""
         logger.info("Starting MainService...")
+
         # Запускаем потребителя в отдельной задаче
         consume_task = asyncio.create_task(
             self._consumer.consume(command=self.process_command, queue="commands")
         )
-
         try:
             while self.is_running:
                 await asyncio.sleep(1)
@@ -117,20 +122,18 @@ class MainService:
             except asyncio.CancelledError:
                 pass
 
-    async def stop(self):
+    async def stop(self, connector):
         logger.info("Stopping MainService...")
         self.is_running = False
 
-        # Останавливаем binance client
-        if hasattr(self._client, 'stop'):
+        if hasattr(self._client, "stop"):
             await self._client.stop()
 
         # Отписываем всех пользователей
         for user_id in list(self.active_connections.keys()):
-            await self.unsubscribe_user(user_id)
+            await self._unsubscribe_user(user_id)
 
-        await self._consumer.disconnect()
-        await self._producer.disconnect()
+        await connector.disconnect()
         logger.info("MainService stopped")
 
 
@@ -146,7 +149,7 @@ async def main():
 
     def signal_handler(signum, frame):
         logger.info(f"Received signal {signum}")
-        asyncio.create_task(service.stop())
+        asyncio.create_task(service.stop(connector=connector))
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -159,13 +162,12 @@ async def main():
         logger.error(f"Service failed: {e}")
     finally:
         if service.is_running:
-            await service.stop()
+            await service.stop(connector=connector)
 
 
 if __name__ == "__main__":
-    # Настройка логирования
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     asyncio.run(main())

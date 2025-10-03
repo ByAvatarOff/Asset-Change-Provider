@@ -3,7 +3,7 @@ import json
 from abc import ABC, abstractmethod
 
 import aio_pika
-from gateways.rabbit.base import RabbitMqConnector
+from provider.gateways.rabbitmq.base import RabbitMqConnector
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ class RabbitMqProducer(Producer):
     async def produce(self, routing_key: str, message: dict) -> None:
         """Отправка сообщения в указанную очередь"""
         try:
+            await self._connector.connect()
             await self._connector.exchanger.publish(
                 aio_pika.Message(
                     body=json.dumps(message).encode(),

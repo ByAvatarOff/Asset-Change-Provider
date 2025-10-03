@@ -1,93 +1,78 @@
-import telegram
 import logging
+from abc import ABC, abstractmethod
 
+from telegram import Bot
+from telegram.error import TelegramError
 
 from provider.core.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
-class TelegramBotManager:
+class NotificationClient(ABC):
+    @abstractmethod
+    async def send_message(self, chat_id: str, message: str) -> bool: ...
+
+    @abstractmethod
+    async def send_init_message(
+self, chat_id: str, symbols: list[str], timeframe: str, thresholds: list[float]
+    ) -> bool: ...
+
+    @abstractmethod
+    async def send_message_with_buttons(self, chat_id: str, message: str, buttons: list[list[str]]) -> bool: ...
+
+
+class TelegramClient(NotificationClient):
     def __init__(self):
-        self.bot = None
-        self.broadcast_configs = {}
+        self.bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 
-    async def initialize(self):
-        """Инициализация Telegram бота"""
+    async def send_message(self, chat_id: str, message: str, parse_mode: str = "HTML") -> bool:
         try:
-            self.bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
-            # Проверяем подключение
-            bot_info = await self.bot.get_me()
-            logger.info(f"Telegram bot initialized: {bot_info.username}")
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=parse_mode
+            )
+            return True
+
+        except TelegramError as e:
+            logger.error(f"Telegram API error: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Failed to initialize Telegram bot: {e}")
-            raise
+            logger.error(f"Failed to send Telegram message: {e}")
+            return False
 
-    def add_broadcast_config(self, config):
-        """Добавляет конфигурацию для трансляции"""
-        self.broadcast_configs[config.chat_id] = config
-        logger.info(f"Added broadcast config for chat: {config.chat_name}")
+    async def send_init_message(
+        self, chat_id: str, symbols: list[str], timeframe: str, thresholds: list[float]
+    ) -> bool:
+        message = settings.INIT_MESSAGE.format(
+            symbols=", ".join(symbols),
+            timeframe=timeframe,
+            thresholds=", ".join(str(t) for t in thresholds)
+        )
+        return await self.send_message(chat_id, message)
 
-    def remove_broadcast_config(self, chat_id: str):
-        """Удаляет конфигурацию трансляции"""
-        if chat_id in self.broadcast_configs:
-            del self.broadcast_configs[chat_id]
-            logger.info(f"Removed broadcast config for chat: {chat_id}")
+    async def send_message_with_buttons(self, chat_id: str, message: str, buttons: list[list[str]]) -> bool:
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    async def send_news(self, news: ClassifiedNews):
-        """Отправляет новость в соответствующие чаты"""
-        if not self.bot:
-            logger.error("Telegram bot not initialized")
-            return
+            keyboard = []
+            for row in buttons:
+                keyboard_row = []
+                for button_text in row:
+                    keyboard_row.append(InlineKeyboardButton(button_text, callback_data=button_text))
+                keyboard.append(keyboard_row)
 
-        sent_count = 0
-        for chat_id, config in self.broadcast_configs.items():
-            if not config.active:
-                continue
+            reply_markup = InlineKeyboardMarkup(keyboard)
 
-            # Проверяем соответствие конфигурации
-            if (news.news_type in config.news_types and
-                    news.source in config.sources and
-                    news.confidence >= config.min_confidence):
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+            return True
 
-                try:
-                    message = self._format_news_message(news)
-                    await self.bot.send_message(
-                        chat_id=chat_id,
-                        text=message,
-                        parse_mode='HTML',
-                        disable_web_page_preview=False
-                    )
-                    sent_count += 1
-                    logger.info(f"Sent news {news.id} to chat {config.chat_name}")
-
-                except Exception as e:
-                    logger.error(f"Failed to send message to {chat_id}: {e}")
-
-        logger.info(f"News {news.id} sent to {sent_count} chats")
-
-    def _format_news_message(self, news: ClassifiedNews) -> str:
-        """Форматирует сообщение для Telegram"""
-        emoji_map = {
-            NewsType.BULLISH: "🚀",
-            NewsType.BEARISH: "🐻",
-            NewsType.NEUTRAL: "📊"
-        }
-
-        emoji = emoji_map.get(news.news_type, "📰")
-        confidence_percent = int(news.confidence * 100)
-
-        message = f"{emoji} <b>{news.title}</b>\n\n"
-
-        # Ограничиваем длину контента
-        content = news.content[:300] + "..." if len(news.content) > 300 else news.content
-        message += f"{content}\n\n"
-
-        message += f"📈 Тип: <b>{news.news_type.value.upper()}</b>\n"
-        message += f"🎯 Уверенность: <b>{confidence_percent}%</b>\n"
-        message += f"📱 Источник: <b>{news.source.value.upper()}</b>\n"
-
-        if news.url:
-            message += f"\n🔗 <a href='{news.url}'>Читать полностью</a>"
-
-        return message
+        except Exception as e:
+            logger.error(f"Failed to send message with buttons: {e}")
+            return False
