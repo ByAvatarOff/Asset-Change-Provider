@@ -69,10 +69,15 @@ class MainService:
     def _calculate_change_level(change_percent: float, thresholds: list[float]) -> int:
         """Определение уровня изменения на основе порогов"""
         change_abs = abs(change_percent)
+        max_level = 0
+
         for level, threshold in enumerate(thresholds, 1):
             if change_abs >= threshold:
-                return level
-        return 0
+                max_level = level
+            else:
+                break
+
+        return max_level
 
     async def _subscribe_user(self, message_schema: InputCommand) -> None:
         await self._unsubscribe_user(message_schema.user_id)

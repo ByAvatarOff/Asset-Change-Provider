@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Price processor started in background")
 
     except Exception as e:
-        logger.error(f"❌ Failed to initialize application components: {e}")
+        logger.error(f"Failed to initialize application components: {e}")
 
     yield
 

@@ -26,8 +26,13 @@ class RabbitMqConsumer(Consumer):
     def __init__(self, connector: RabbitMqConnector):
         self.connector = connector
         self._is_consuming = False
+        self._consuming_task = None
 
     async def consume(self, command: Callable, queue: str) -> None:
+        if self._is_consuming:
+            logger.warning(f"Consumer for {queue} is already running")
+            return
+
         self._is_consuming = True
 
         try:
@@ -42,10 +47,7 @@ class RabbitMqConsumer(Consumer):
                     await message.nack()
 
             await rabbit_queue.consume(message_handler)
-            logger.info(f"✅ Started consuming from queue: {queue}")
-
-            while self._is_consuming:
-                await asyncio.sleep(1)
+            logger.info(f"✅ Registered consumer for queue: {queue}")
 
         except asyncio.CancelledError:
             logger.info(f"Consuming from {queue} cancelled")
